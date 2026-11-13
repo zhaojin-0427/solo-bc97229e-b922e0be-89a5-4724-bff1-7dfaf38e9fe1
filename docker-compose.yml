@@ -6,6 +6,8 @@ services:
       DP_DB_PATH: /data/dp_transit.db
       DP_LEASE_SECONDS: "15"
       DP_HEARTBEAT_SECONDS: "3"
+      # 后台恢复线程扫描间隔：无新查询时也自动接续退出进程遗留的任务
+      DP_RECOVERY_INTERVAL: "1"
     volumes:
       - dp_data:/data
     restart: unless-stopped
@@ -22,6 +24,7 @@ services:
       DP_DB_PATH: /data/dp_transit.db
       DP_LEASE_SECONDS: "15"
       DP_HEARTBEAT_SECONDS: "3"
+      DP_RECOVERY_INTERVAL: "1"
     volumes:
       - dp_data:/data
     restart: unless-stopped

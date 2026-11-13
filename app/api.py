@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from . import budget as budget_mod
-from . import importer, tasks
+from . import importer, locks, tasks
 from .db import get_conn, init_db
 from .models import BudgetResponse, ImportResponse, QueryRequest, QueryResponse, TaskOut
 from .tasks import WORKER_ID
@@ -22,8 +22,15 @@ logging.basicConfig(level=logging.INFO,
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    # 进程存活锁：供其他进程区分「已退出」与「被挂起」，进程退出时内核自动释放。
+    locks.acquire_process_lock(WORKER_ID)
+    locks.cleanup_stale_locks()
+    # 后台恢复线程：无新查询时也自动接续退出进程遗留的任务；
+    # 启动即扫一轮，全部服务重启后同样自动接续。
+    tasks.start_recovery()
     logger.info("worker %s started, db initialized", WORKER_ID)
     yield
+    tasks.stop_recovery()
 
 
 app = FastAPI(
@@ -31,7 +38,8 @@ app = FastAPI(
     description=(
         "一次导入乘车 CSV 后只读；查询返回去重乘客数 + 独立 Laplace(0,1/ε) 噪声，"
         "不返回真值。总预算 1，先预留 ε 成功后转实扣；同集合同 ε 永久复用、不重复扣费；"
-        "两个 API 进程共享 SQLite，相同查询复用在途任务，支持崩溃租约接续。"
+        "两个 API 进程共享 SQLite，相同查询复用在途任务；执行进程退出后由存活服务"
+        "自动接续遗留任务（无需新查询，全量重启后同样恢复），被挂起的执行者不被接管。"
     ),
     version="1.0.0",
     lifespan=lifespan,

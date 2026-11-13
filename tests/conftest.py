@@ -19,6 +19,7 @@ os.environ.setdefault("DP_DB_PATH", str(Path(_TMP_DB_DIR) / "bootstrap.db"))
 os.environ.setdefault("DP_LEASE_SECONDS", "2")
 os.environ.setdefault("DP_HEARTBEAT_SECONDS", "0.3")
 os.environ.setdefault("DP_QUERY_WAIT_TIMEOUT", "30")
+os.environ.setdefault("DP_RECOVERY_INTERVAL", "0.2")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -33,6 +34,7 @@ def app_env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "HEARTBEAT_SECONDS", 0.3)
     monkeypatch.setattr(config, "QUERY_WAIT_TIMEOUT_SECONDS", 30.0)
     monkeypatch.setattr(config, "POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(config, "RECOVERY_INTERVAL_SECONDS", 0.1)
 
     db._initialized.clear()
     db.init_db()

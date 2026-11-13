@@ -9,9 +9,15 @@
 2. 预算检查与预留放在同一个 BEGIN IMMEDIATE 事务中，跨进程串行化。
 3. 加噪结果、任务成功、预留转实扣在同一事务提交；提交前绝不返回，
    响应丢失后重试命中缓存，拿到的是同一份噪声，不会重新扰动、不重复扣费。
-4. 执行进程靠心跳续租；租约过期后其他进程才能接管（generation +1），
-   存活进程的心跳会持续推高 lease_expires_at，因此不会被接管。
+4. 执行进程靠心跳续租；租约过期后其他进程才能接管（generation +1）。
+   接管前先查进程存活锁（app.locks）：拥有者仍存活（如被 SIGSTOP 挂起）
+   时一律不接管，SIGCONT 后由原执行者完成；只有确认进程已退出
+   （锁被内核释放）才接管，且接管沿用原预留，不重复预留或扣费。
 5. 失败只记结果为 failed 并退还预留；不写 query_results，重试才会重新采样噪声。
+6. 每个进程的后台恢复线程周期扫描「租约过期且拥有者已退出」的在途任务并
+   自动接管执行：没有新查询时存活服务也会完成退出进程遗留的任务；
+   进程启动时立即扫描一轮，全部服务重启后同样自动接续。
+   恢复与新请求的并发争抢由同一条条件 UPDATE 串行化，至多一方成功。
 """
 from __future__ import annotations
 
@@ -27,7 +33,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import budget as budget_mod
-from . import config, privacy
+from . import config, locks, privacy
 from .db import get_conn, write_tx
 from .models import canonicalize, dumps_stations
 
@@ -100,6 +106,23 @@ def _heartbeat(task_id: int, generation: int, stop_event: threading.Event,
             return
 
 
+def _takeover_locked(conn: sqlite3.Connection, task_id: int, now: float) -> Optional[sqlite3.Row]:
+    """在已持有的写事务内原子接管过期任务（沿用原预留，不写新 reserve）。
+
+    条件 UPDATE 同时约束 active=1 与租约仍过期：与恢复线程、其他进程的
+    接管并发争抢时至多一方成功（rowcount=1），保证同一查询只有一个实际执行。
+    """
+    cur = conn.execute(
+        "UPDATE tasks SET worker_id = ?, generation = generation + 1, "
+        "status = 'running', lease_expires_at = ?, updated_at = ?, error = NULL "
+        "WHERE id = ? AND active = 1 AND lease_expires_at <= ?",
+        (WORKER_ID, now + config.LEASE_SECONDS, _utcnow(), task_id, now),
+    )
+    if cur.rowcount != 1:
+        return None
+    return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
 def _elect(key: str, epsilon: float, stations: list[str],
            stations_json: str) -> tuple[str, sqlite3.Row]:
     """一次选举事务，返回 ('leader', task_row) 或 ('follower', task_row)。
@@ -118,16 +141,14 @@ def _elect(key: str, epsilon: float, stations: list[str],
             if task is not None:
                 if task["lease_expires_at"] > now and task["active"] == 1:
                     return "follower", task
-                # 租约过期：原子接管（条件 UPDATE 防止与其他接管者竞争）。
-                cur = conn.execute(
-                    "UPDATE tasks SET worker_id = ?, generation = generation + 1, "
-                    "status = 'running', lease_expires_at = ?, updated_at = ?, error = NULL "
-                    "WHERE id = ? AND active = 1 AND lease_expires_at <= ?",
-                    (WORKER_ID, now + config.LEASE_SECONDS, _utcnow(),
-                     task["id"], now),
-                )
-                if cur.rowcount == 1:
-                    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+                if locks.worker_alive(task["worker_id"]):
+                    # 拥有者进程仍存活（如被 SIGSTOP 挂起）：租约过期也不得接管，
+                    # 转为跟随等待，SIGCONT 后由原执行者完成。
+                    return "follower", task
+                # 拥有者已退出：原子接管（条件 UPDATE 防止与其他接管者竞争），
+                # 沿用原预留，不重复预留或扣费。
+                row = _takeover_locked(conn, task["id"], now)
+                if row is not None:
                     return "leader", row
                 raise _ElectionRetry()
 
@@ -250,11 +271,101 @@ def _execute_as_leader(task: sqlite3.Row, epsilon: float, stations: list[str]) -
         stop_event.set()
 
 
+# ---------------------------------------------------------------- 崩溃恢复
+
+_recovery_stop = threading.Event()
+_recovery_thread: Optional[threading.Thread] = None
+_recovery_lock = threading.Lock()
+
+
+def recover_once(now: Optional[float] = None) -> int:
+    """扫描并接管「拥有者进程已退出」的过期在途任务，返回本轮接管数量。
+
+    无需新查询触发：存活服务周期性调用；进程启动时也会立即调用，
+    因此全部服务重启后同样自动接续。接管沿用原预留（不写新 reserve），
+    与新请求的选举接管由同一条条件 UPDATE 串行化，并发争抢至多一方成功。
+    """
+    now = time.time() if now is None else now
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE active = 1 AND lease_expires_at <= ?",
+            (now,),
+        ).fetchall()
+    taken = 0
+    for task in rows:
+        if _recovery_stop.is_set():
+            break
+        if locks.worker_alive(task["worker_id"]):
+            # 拥有者仍存活（如被 SIGSTOP 挂起）：不得接管，等其恢复后自行完成。
+            continue
+        row = _try_takeover(task["id"], now)
+        if row is None:
+            continue  # 被其他进程/新请求抢先接管，或租约已被续期
+        taken += 1
+        logger.warning(
+            "task %s (key=%s) orphaned by dead worker %s, taken over by %s as gen %s",
+            row["id"], row["canonical_key"][:12], task["worker_id"],
+            WORKER_ID, row["generation"],
+        )
+        stations = json.loads(row["stations_json"])
+        threading.Thread(
+            target=_execute_as_leader,
+            args=(row, float(row["epsilon"]), stations),
+            name=f"recover-task-{row['id']}", daemon=True,
+        ).start()
+    return taken
+
+
+def _try_takeover(task_id: int, now: float) -> Optional[sqlite3.Row]:
+    """独立写事务条件接管；写锁竞争或条件不满足时返回 None，下轮再试。"""
+    try:
+        with get_conn() as conn:
+            with write_tx(conn):
+                return _takeover_locked(conn, task_id, now)
+    except sqlite3.OperationalError:
+        return None
+
+
+def _recovery_loop() -> None:
+    while not _recovery_stop.is_set():
+        try:
+            recover_once()
+        except Exception:
+            logger.exception("recovery scan failed")
+        _recovery_stop.wait(config.RECOVERY_INTERVAL_SECONDS)
+
+
+def start_recovery() -> None:
+    """启动后台恢复线程（幂等）。线程启动后立即先扫描一轮。"""
+    global _recovery_thread
+    with _recovery_lock:
+        if _recovery_thread is not None and _recovery_thread.is_alive():
+            return
+        _recovery_stop.clear()
+        _recovery_thread = threading.Thread(
+            target=_recovery_loop, name="task-recovery", daemon=True
+        )
+        _recovery_thread.start()
+
+
+def stop_recovery() -> None:
+    """停止后台恢复线程（进程关闭/测试回收时调用）。"""
+    global _recovery_thread
+    with _recovery_lock:
+        _recovery_stop.set()
+        thread = _recovery_thread
+        _recovery_thread = None
+    if thread is not None:
+        thread.join(timeout=5)
+
+
 def _poll(key: str, epsilon: float, task_id: int,
           deadline: float) -> tuple[Optional[sqlite3.Row], str]:
     """只读轮询，返回 (缓存行或None, 状态)。
 
     状态取值：cached / failed / lease_expired / waiting。
+    租约过期但拥有者进程仍存活（如被 SIGSTOP 挂起）时返回 waiting：
+    不得接管，继续等待原执行者恢复。
     """
     with get_conn() as conn:
         cached = _find_cached(conn, key, epsilon)
@@ -266,7 +377,8 @@ def _poll(key: str, epsilon: float, task_id: int,
         if task is not None and task["active"] == 0 and task["status"] == "failed":
             return None, "failed"
         if task is not None and task["active"] == 1 \
-                and task["lease_expires_at"] <= time.time():
+                and task["lease_expires_at"] <= time.time() \
+                and not locks.worker_alive(task["worker_id"]):
             return None, "lease_expired"
     return None, "waiting"
 

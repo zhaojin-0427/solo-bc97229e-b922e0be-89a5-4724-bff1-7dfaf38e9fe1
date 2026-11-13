@@ -23,6 +23,11 @@ HEARTBEAT_SECONDS = float(os.getenv("DP_HEARTBEAT_SECONDS", "3"))
 POLL_INTERVAL_SECONDS = float(os.getenv("DP_POLL_INTERVAL", "0.2"))
 QUERY_WAIT_TIMEOUT_SECONDS = float(os.getenv("DP_QUERY_WAIT_TIMEOUT", "120"))
 
+# 崩溃恢复：后台线程扫描「租约过期且拥有者进程已退出」的在途任务并自动
+# 接续的间隔（秒）。无需新查询触发；进程启动时会立即扫描一轮，
+# 因此全部服务重启后同样自动接续。
+RECOVERY_INTERVAL_SECONDS = float(os.getenv("DP_RECOVERY_INTERVAL", "1.0"))
+
 # 单次写事务拿不到写锁时的 busy timeout（SQLite 内置重试）。
 BUSY_TIMEOUT_MS = int(os.getenv("DP_BUSY_TIMEOUT_MS", "15000"))
 
